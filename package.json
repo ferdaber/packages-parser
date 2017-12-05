@@ -1,0 +1,21 @@
+{
+  "name": "packages-parser",
+  "version": "0.1.0",
+  "description": "A package parser for monorepos",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "bin": "index.js",
+  "author": "Ferdy Budhidharma",
+  "license": "MIT",
+  "dependencies": {
+    "bluebird": "^3.5.1",
+    "glob": "^7.1.2",
+    "lodash": "^4.17.4",
+    "minimatch": "^3.0.4",
+    "request-promise": "^4.2.2",
+    "semver": "^5.4.1",
+    "yargs": "^10.0.3"
+  }
+}
