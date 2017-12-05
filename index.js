@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-const Promise = require('bluebird')
 const _ = require('lodash')
+const Dependencies = require('./dependencies')
 const minimatch = require('minimatch')
+const Promise = require('bluebird')
 const request = require('request-promise')
 const { resolve } = require('path')
 const semver = require('semver')
@@ -17,56 +18,39 @@ const {
   pass
 } = require('yargs').argv
 
-const deps = Object.create(null)
+const deps = new Dependencies(dependencyNamePattern)
 
-function pushDependencyVersion (depVersion, depName) {
-  if (dependencyNamePattern && !minimatch(depName, dependencyNamePattern)) return
-
-  deps[depName] = deps[depName] || {}
-  deps[depName].versions = deps[depName].versions || []
-  if (!deps[depName].versions.some(version => version === depVersion)) {
-    deps[depName].versions.push(depVersion)
-  }
-}
-
-function setDependencyRegistry (registry, depName) {
-  deps[depName] = deps[depName] || {}
-  deps[depName].registry = registry
-}
-
-function setDependencyVersion (version, depName) {
-  deps[depName] = deps[depName] || {}
-  deps[depName].currentVersion = version
-}
-
-function exitWithError (...messages) {
+function exitWithError(...messages) {
   messages.forEach(message => console.log(message))
   process.exit(1)
 }
 
-function combineUris (...uris) {
+function combineUris(...uris) {
   return uris.reduce(
-    (combinedUri, uri) => (combinedUri.endsWith('/') ? `${ combinedUri }${ uri }` : `${ combinedUri }/${ uri }`)
+    (combinedUri, uri) => (combinedUri.endsWith('/') ? `${combinedUri}${uri}` : `${combinedUri}/${uri}`)
   )
 }
 
 let pattern = commands[0]
+!pattern && exitWithError('File pattern is required to run the parser.')
 if (!pattern.endsWith('/')) pattern += '/'
 glob(pattern)
   .then(matches =>
     Promise.all(
+      // get file path glob matches, and run fs.stat on those paths to check if they're directories or direct links to package.json
       matches.map(filePath => resolve(filePath)).map(filePath =>
         stat(filePath).then(stats => {
           try {
-            const packageJson = stats.isDirectory() ? require(`${ filePath }/package.json`) : require(filePath)
+            // get the package.json information and add the metadata to the Dependencies object
+            const packageJson = stats.isDirectory() ? require(`${filePath}/package.json`) : require(filePath)
             const { name, dependencies, devDependencies, publishConfig, version } = packageJson
             const registry = publishConfig && publishConfig.registry
-            setDependencyRegistry(registry || registryUrl, name)
-            setDependencyVersion(version, name)
-            _.forEach(dependencies, pushDependencyVersion)
-            _.forEach(devDependencies, pushDependencyVersion)
-          } catch (e) {
-            exitWithError(`Could not load module from file path: ${ filePath }`, e)
+            deps.setDependencyRegistry(registry || registryUrl, name)
+            deps.setDependencyVersion(version, name)
+            _.forEach(dependencies, (range, depName) => deps.addDependencyVersion(range, depName))
+            _.forEach(devDependencies, (range, depName) => deps.addDependencyVersion(range, depName))
+          } catch (error) {
+            exitWithError(`Could not load module from file path: ${filePath}`, error)
           }
         })
       )
@@ -79,8 +63,10 @@ glob(pattern)
       console.log(deps) ||
       Promise.all(
         _.map(
-          _.pickBy(deps, ({ registry, versions }) => registry && versions && versions.length),
-          ({ registry, versions }, depName) =>
+          // filter out any package metadata that doesn't have dependents
+          _.pickBy(deps, ({ registry, versionRanges }) => registry && versionRanges && versionRanges.length),
+          ({ registry, versionRanges }, depName) =>
+            // check the registry to get source-of-truth metadata for the package
             request({
               method: 'GET',
               uri: combineUris(registry, depName),
@@ -93,8 +79,9 @@ glob(pattern)
               const registryVersionNumbers = Object.keys(registryVersions)
               return {
                 name: depName,
+                // find the unique maximum version numbers downloadable based on all ranges set by dependents
                 uniqueRegistryVersions: _.uniq(
-                  versions
+                  versionRanges
                     .map(range => semver.maxSatisfying(registryVersionNumbers, range))
                     .filter(version => version != null)
                 )
