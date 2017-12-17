@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 const _ = require('lodash')
-const Dependencies = require('./dependencies')
+const PackageData = require('./package-data')
 const minimatch = require('minimatch')
 const Promise = require('bluebird')
 const request = require('request-promise')
 const { resolve } = require('path')
 const semver = require('semver')
+const prettyFormat = require('pretty-format')
+
+const { combineUris, exitWithError } = require('./utils')
+const { getResolvedDependentsVersions } = require('./package-utils')
 
 const stat = Promise.promisify(require('fs').stat)
 const glob = Promise.promisify(require('glob'))
@@ -18,18 +22,7 @@ const {
   pass
 } = require('yargs').argv
 
-const deps = new Dependencies(dependencyNamePattern)
-
-function exitWithError(...messages) {
-  messages.forEach(message => console.log(message))
-  process.exit(1)
-}
-
-function combineUris(...uris) {
-  return uris.reduce(
-    (combinedUri, uri) => (combinedUri.endsWith('/') ? `${combinedUri}${uri}` : `${combinedUri}/${uri}`)
-  )
-}
+const packagesData = new PackageData(dependencyNamePattern)
 
 let pattern = commands[0]
 !pattern && exitWithError('File pattern is required to run the parser.')
@@ -43,12 +36,13 @@ glob(pattern)
           try {
             // get the package.json information and add the metadata to the Dependencies object
             const packageJson = stats.isDirectory() ? require(`${filePath}/package.json`) : require(filePath)
-            const { name, dependencies, devDependencies, publishConfig, version } = packageJson
+            const { name, dependencies, devDependencies, publishConfig } = packageJson
             const registry = publishConfig && publishConfig.registry
-            deps.setDependencyRegistry(registry || registryUrl, name)
-            deps.setDependencyVersion(version, name)
-            _.forEach(dependencies, (range, depName) => deps.addDependencyVersion(range, depName))
-            _.forEach(devDependencies, (range, depName) => deps.addDependencyVersion(range, depName))
+            packagesData.setRegistry(name, registry || registryUrl)
+            packagesData.setLocalPackageInfo(name, packageJson)
+            packagesData.setLocalPath(name, filePath)
+            _.forEach(dependencies, (range, packageName) => packagesData.addDependent(packageName, name, range))
+            _.forEach(devDependencies, (range, packageName) => packagesData.addDependent(packageName, name, range))
           } catch (error) {
             exitWithError(`Could not load module from file path: ${filePath}`, error)
           }
@@ -56,42 +50,35 @@ glob(pattern)
       )
     )
   )
-  .then(
-    () =>
-      console.log('Dependencies') ||
-      console.log('-----------------------') ||
-      console.log(deps) ||
-      Promise.all(
-        _.map(
-          // filter out any package metadata that doesn't have dependents
-          _.pickBy(deps, ({ registry, versionRanges }) => registry && versionRanges && versionRanges.length),
-          ({ registry, versionRanges }, depName) =>
-            // check the registry to get source-of-truth metadata for the package
-            request({
-              method: 'GET',
-              uri: combineUris(registry, depName),
-              auth: {
-                user,
-                pass
-              }
-            }).then(response => {
-              const { versions: registryVersions } = JSON.parse(response)
-              const registryVersionNumbers = Object.keys(registryVersions)
-              return {
-                name: depName,
-                // find the unique maximum version numbers downloadable based on all ranges set by dependents
-                uniqueRegistryVersions: _.uniq(
-                  versionRanges
-                    .map(range => semver.maxSatisfying(registryVersionNumbers, range))
-                    .filter(version => version != null)
-                )
-              }
-            })
-        )
+  .then(() =>
+    Promise.all(
+      _.map(_.pickBy(packagesData.packages, pkg => pkg.registry != null), (pkg, packageName) =>
+        request({
+          method: 'GET',
+          uri: combineUris(pkg.registry, packageName),
+          auth: {
+            user,
+            pass
+          }
+        }).then(response => {
+          const remotePackageData = JSON.parse(response)
+          packagesData.setRemotePackageInfo(packageName, remotePackageData)
+          return packagesData.packages[remotePackageData]
+        }).catch(error => {
+          if (error.statusCode === 404) {
+            console.warn(`Package not found for '${packageName}', tried looking in: ${error.options.uri}, skipping this package.`)
+          }
+        })
       )
+    )
   )
-  .then(
-    depsMetadata =>
-      console.log('Dependency Metadata') || console.log('-----------------------') || console.log(depsMetadata)
-  )
+  .then(() => {
+    // do stuff here, local and remote package data is fully hydrated at this point
+    const resolvedDependentsVersions = _.mapValues(packagesData.packages, pkg => ({
+      dependents: getResolvedDependentsVersions(pkg)
+    }))
+    console.log(prettyFormat(packagesData.packages))
+    console.log('=====================================================')
+    console.log(prettyFormat(resolvedDependentsVersions))
+  })
   .catch(exitWithError)
